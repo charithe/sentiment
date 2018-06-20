@@ -2,16 +2,21 @@ package sentiment
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	language "cloud.google.com/go/language/apiv1"
 	"github.com/allegro/bigcache"
 	"github.com/gogo/protobuf/proto"
+	gax "github.com/googleapis/gax-go"
 	"go.uber.org/zap"
-	"google.golang.org/api/option"
 	languagepb "google.golang.org/genproto/googleapis/cloud/language/v1"
 )
 
@@ -58,15 +63,24 @@ const (
 // Response is the expected output type from the service
 type Response []map[string]float32
 
+type input struct {
+	Content string `json:"content"`
+}
+
+type languageClient interface {
+	AnalyzeSentiment(context.Context, *languagepb.AnalyzeSentimentRequest, ...gax.CallOption) (*languagepb.AnalyzeSentimentResponse, error)
+	Close() error
+}
+
 // Service implements the sentiment analysis API extension
 type Service struct {
 	conf   *config
-	client *language.Client
+	client languageClient
 	cache  *bigcache.BigCache
 }
 
-// NewService creates a new sentiment analysis API extension with the given API key and options
-func NewService(apiKey string, opts ...Option) (*Service, error) {
+// NewService creates a new sentiment analysis API extension with the given options
+func NewService(opts ...Option) (*Service, error) {
 	conf := &config{
 		requestTimeout: 1 * time.Second,
 		cacheMaxSizeMB: 64,
@@ -77,7 +91,7 @@ func NewService(apiKey string, opts ...Option) (*Service, error) {
 		opt(conf)
 	}
 
-	client, err := language.NewClient(context.Background(), option.WithAPIKey(apiKey))
+	client, err := language.NewClient(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Google language client: %+v", err)
 	}
@@ -96,8 +110,89 @@ func NewService(apiKey string, opts ...Option) (*Service, error) {
 	}, nil
 }
 
-// Handle is the entrypoint into the service
-func (svc *Service) Handle(ctx context.Context, input string, sort SortOrder, limit int) (Response, error) {
+// Close terminates the service
+func (svc *Service) Close() error {
+	if svc.client != nil {
+		return svc.client.Close()
+	}
+	return nil
+}
+
+// RESTHandler implements the http Handler interface to provide sentiment analysis services
+func (svc *Service) RESTHandler() http.Handler {
+	mux := http.NewServeMux()
+	// api handler
+	mux.HandleFunc("/api", svc.handleHTTPRequest)
+	// health handler for Kubernetes liveness check
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			defer func() {
+				io.Copy(ioutil.Discard, r.Body)
+				r.Body.Close()
+			}()
+		}
+
+		w.WriteHeader(http.StatusOK)
+	})
+
+	return mux
+}
+
+func (svc *Service) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Body != nil {
+		defer func() {
+			io.Copy(ioutil.Discard, r.Body)
+			r.Body.Close()
+		}()
+	}
+
+	if r.Method != http.MethodPost {
+		zap.S().Warnw("Bad request method")
+		http.Error(w, "Bad request method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var inp input
+	if err := json.NewDecoder(r.Body).Decode(&inp); err != nil {
+		zap.S().Errorw("Failed to parse request body", "error", err)
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	params := r.URL.Query()
+
+	sortOrder := Ascending
+	if so := params.Get("order"); so != "" && strings.ToLower(so) == "desc" {
+		sortOrder = Descending
+	}
+
+	limit := -1
+	if l := params.Get("limit"); l != "" {
+		limitVal, err := strconv.Atoi(l)
+		if err != nil {
+			zap.S().Warnw("Invalid limit parameter", "limit", l, "error", err)
+		} else {
+			limit = limitVal
+		}
+	}
+
+	resp, err := svc.ProcessSentiment(r.Context(), inp.Content, sortOrder, limit)
+	if err != nil {
+		zap.S().Errorw("Request failed", "error", err)
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Add("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		zap.S().Errorw("Failed to marshal response", "error", err)
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+}
+
+// ProcessSentiment implements the logic of processing a sentiment analysis request
+func (svc *Service) ProcessSentiment(ctx context.Context, input string, sort SortOrder, limit int) (Response, error) {
 	if err := ctx.Err(); err != nil {
 		zap.S().Warnw("Context cancelled", "error", err, "input", input)
 		return nil, err
@@ -165,7 +260,9 @@ func (svc *Service) processAPIResult(ctx context.Context, result *languagepb.Ana
 	}
 
 	arraySize := limit
-	if len(result.Sentences) < limit {
+	if arraySize < 0 {
+		arraySize = len(result.Sentences)
+	} else if len(result.Sentences) < arraySize {
 		arraySize = len(result.Sentences)
 	}
 
